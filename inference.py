@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 import requests
 
@@ -29,8 +30,6 @@ if not HF_TOKEN:
     print("[WARN] No API key set — LLM calls will fail.", file=sys.stderr)
 
 _session = requests.Session()
-
-# Lazy-init OpenAI client to avoid import-time httpx errors
 _client = None
 
 
@@ -42,7 +41,7 @@ def _get_client():
     return _client
 
 
-# ── Which submission action belongs to which task ───────────────────────────
+# ── Constants ───────────────────────────────────────────────────────────────
 _TASK_SUBMIT = {
     "alert_classification":  "submit_severity",
     "root_cause_analysis":   "submit_root_cause",
@@ -66,7 +65,6 @@ _REM_TYPES = frozenset({
 _ALL_VALID = _DIAG_TYPES | _SUBMIT_TYPES | _REM_TYPES
 
 
-# ── System prompt — general SRE strategy, NO scenario answers ───────────────
 SYSTEM_PROMPT = """\
 You are an expert Site Reliability Engineer responding to a production incident.
 Reply with exactly ONE JSON action object. No markdown, no explanation, no extra text.
@@ -86,40 +84,43 @@ VALID ACTIONS:
 {"action_type":"submit_resolution","parameters":{"summary":"<3+ sentence summary>"}}
 
 RULES:
-- Service names MUST exactly match the KNOWN_SERVICES list in the observation.
+- Service names MUST exactly match the KNOWN_SERVICES list.
 - P1 = complete outage OR revenue > $1,000/min.  P2 = major degradation.
-  P3 = minor issue.  P4 = informational.
-- Root cause = the upstream service that TRIGGERED the cascade. This is often
-  NOT listed in the alert's affected_services. Investigate services not in the
-  alert first.
-- submit_resolution summary must be 3+ sentences: (1) what failed and why,
-  (2) actions you took to fix it, (3) current recovery status.
-- Submit as soon as evidence is clear — do NOT waste steps querying more.
+  P3 = minor/partial issue with graceful fallback.  P4 = informational.
+- IMPORTANT: check_recent_deploys and check_dependencies require prior
+  investigation. You MUST query_logs or check_metrics on a service BEFORE
+  checking its deploys or dependencies. Otherwise you get limited data.
+- Root cause = the upstream service that TRIGGERED the cascade. Often NOT
+  in the alert's affected_services list.
+- submit_resolution summary: 3+ sentences about what failed, what you did, status.
+- Submit as soon as evidence is clear — do NOT waste steps.
 
-TASK-SPECIFIC STRATEGY:
+STRATEGY:
 
 alert_classification (max 3 steps):
-  Query 1-2 affected services for evidence, then submit_severity.
+  Query 1-2 services with logs/metrics, then submit_severity.
+  Check revenue_impact and error_rate carefully. Not all high error rates are P1.
 
 root_cause_analysis (max 10 steps):
-  Investigate services NOT in the alert first (check logs + recent deploys).
-  Look for: OOM kills, BGP withdrawals, config changes, unbounded queries.
-  Submit submit_root_cause with the triggering service and failure mode.
+  1. query_logs or check_metrics on 2-3 services to understand the blast radius
+  2. THEN check_recent_deploys on services that look suspicious
+  3. Look for the service whose deploy/change CAUSED the cascade
+  4. Submit submit_root_cause with service and failure_mode
 
 remediation_planning (max 15 steps):
-  1. Query logs to confirm root cause.
-  2. Execute fixes: disable bad jobs, restart crashed services, rollback configs,
-     run runbook steps.
-  3. Submit submit_resolution with a detailed 3-sentence summary.
+  1. query_logs on affected services to confirm root cause
+  2. Execute remediation actions in logical order
+  3. Verify recovery with check_service_status
+  4. Submit submit_resolution with detailed summary
 
 CRITICAL: Each task has ONE correct submission action:
   alert_classification  -> submit_severity
   root_cause_analysis   -> submit_root_cause
-  remediation_planning  -> submit_resolution
-Do NOT use the wrong submission type for the task."""
+  remediation_planning  -> submit_resolution"""
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
 def _queried_svcs(queried_data: dict) -> set[str]:
     return {
         svc
@@ -130,7 +131,6 @@ def _queried_svcs(queried_data: dict) -> set[str]:
 
 
 def _extract_signals(queried_data: dict) -> list[str]:
-    """Surface key patterns from queried data — shown to LLM."""
     seen: set[str] = set()
     signals: list[str] = []
 
@@ -154,21 +154,25 @@ def _extract_signals(queried_data: dict) -> list[str]:
                 _add(f"Cache purge in {svc}")
             if "unbounded" in t or "no limit" in t:
                 _add(f"Unbounded query in {svc}")
+            if "credential" in t or "password" in t or "authentication failed" in t:
+                _add(f"Credential/auth issue in {svc}")
+            if "requires deeper investigation" in t or "requires initial investigation" in t:
+                _add(f"GATED: {svc} needs logs/metrics first before checking deploys")
             if action_type == "check_recent_deploys" and any(
-                x in t for x in ("ago", "change", "update", "added")
+                x in t for x in ("ago", "change", "update", "added", "deploy")
             ):
-                snippet = str(data)[:120].replace("\n", " ")
-                _add(f"Recent change in {svc}: {snippet}")
+                if "requires" not in t:  # Don't show gated responses as signals
+                    snippet = str(data)[:120].replace("\n", " ")
+                    _add(f"Recent change in {svc}: {snippet}")
     return signals
 
 
-# ── Message builders ────────────────────────────────────────────────────────
 def _first_obs_msg(obs: dict) -> str:
-    alert    = obs.get("alert", {})
-    known    = obs.get("known_services", [])
+    alert = obs.get("alert", {})
+    known = obs.get("known_services", [])
     affected = alert.get("affected_services", [])
-    task_id  = obs.get("task_id", "")
-    non_aff  = [s for s in known if s not in affected]
+    task_id = obs.get("task_id", "")
+    non_aff = [s for s in known if s not in affected]
 
     lines = [
         "=== NEW INCIDENT ===",
@@ -182,34 +186,37 @@ def _first_obs_msg(obs: dict) -> str:
         if alert.get("title"):
             lines.append(f"  Title: {alert['title']}")
         if affected:
-            lines.append(f"  Directly affected services: {', '.join(affected)}")
+            lines.append(f"  Directly affected: {', '.join(affected)}")
         for s in alert.get("symptoms", []):
             lines.append(f"  - {s}")
         for k in ("error_rate", "duration_minutes", "revenue_impact_per_min"):
             if alert.get(k) is not None:
                 lines.append(f"  {k}: {alert[k]}")
 
-    lines.append(f"KNOWN_SERVICES (use these EXACT names): {json.dumps(known)}")
+    lines.append(f"KNOWN_SERVICES: {json.dumps(known)}")
 
     if non_aff and task_id in ("root_cause_analysis", "remediation_planning"):
-        lines.append(
-            f"  *** These services are NOT in the alert — investigate them "
-            f"for possible root cause: {json.dumps(non_aff)} ***"
-        )
+        lines.append(f"  Services NOT in alert (investigate these too): {json.dumps(non_aff)}")
 
     lines.append(f"AVAILABLE ACTIONS: {obs.get('available_actions', [])}")
     lines.append(f"REQUIRED SUBMISSION: {_TASK_SUBMIT.get(task_id, 'unknown')}")
+
+    if task_id in ("root_cause_analysis", "remediation_planning"):
+        lines.append("")
+        lines.append("NOTE: check_recent_deploys requires prior investigation.")
+        lines.append("You MUST query_logs or check_metrics on a service FIRST.")
+
     lines.append("")
-    lines.append("Respond with your first action (JSON only, no markdown):")
+    lines.append("Respond with your first action (JSON only):")
     return "\n".join(lines)
 
 
 def _step_msg(obs: dict, prev_queried: dict) -> str:
-    step      = obs.get("step_count", 0)
+    step = obs.get("step_count", 0)
     max_steps = obs.get("max_steps", 10)
-    left      = max_steps - step
-    queried   = obs.get("queried_data", {})
-    task_id   = obs.get("task_id", "")
+    left = max_steps - step
+    queried = obs.get("queried_data", {})
+    task_id = obs.get("task_id", "")
 
     lines = [
         f"Step {step}/{max_steps} ({left} remaining) | "
@@ -217,7 +224,6 @@ def _step_msg(obs: dict, prev_queried: dict) -> str:
         f"feedback: {obs.get('feedback', '')}",
     ]
 
-    # Show new data received
     new_data = []
     for action_type, services in queried.items():
         prev = prev_queried.get(action_type, {})
@@ -229,35 +235,26 @@ def _step_msg(obs: dict, prev_queried: dict) -> str:
                         d = d[:500] + "..."
                     new_data.append(f"  [{action_type}][{svc}]: {d}")
     if new_data:
-        lines.append("NEW DATA RECEIVED:")
+        lines.append("NEW DATA:")
         lines.extend(new_data)
 
-    # Show extracted signals
     signals = _extract_signals(queried)
     if signals:
-        lines.append("KEY SIGNALS DETECTED:")
+        lines.append("SIGNALS:")
         for sig in signals:
             lines.append(f"  *** {sig} ***")
 
-    # Urgency reminders
     if left <= 3:
-        lines.append(
-            f"*** {left} steps remaining — submit "
-            f"{_TASK_SUBMIT.get(task_id, 'your answer')} soon ***"
-        )
+        lines.append(f"*** {left} steps left — submit {_TASK_SUBMIT.get(task_id, '')} soon ***")
     if left <= 1:
-        lines.append(
-            f"!!! LAST STEP — YOU MUST {_TASK_SUBMIT.get(task_id, 'SUBMIT')} NOW !!!"
-        )
+        lines.append(f"!!! LAST STEP — MUST {_TASK_SUBMIT.get(task_id, 'SUBMIT')} NOW !!!")
 
-    lines.append("Next action (JSON only, no markdown):")
+    lines.append("Next action (JSON only):")
     return "\n".join(lines)
 
 
-# ── Parse LLM output ───────────────────────────────────────────────────────
 def _parse(text: str) -> dict:
     text = text.strip()
-    # Strip markdown code fences
     if text.startswith("`"):
         text = "\n".join(
             ln for ln in text.splitlines() if not ln.startswith("`")
@@ -272,125 +269,92 @@ def _parse(text: str) -> dict:
         raise
 
 
-# ── Fallback — generic, no scenario knowledge ──────────────────────────────
 def _fallback_submit(task_id: str, obs: dict) -> dict:
-    """Minimal correct-type submission. Will score low but won't crash."""
     alert = obs.get("alert", {})
     known = obs.get("known_services", [])
 
     if task_id == "alert_classification":
         rev = alert.get("revenue_impact_per_min", 0) or 0
         err = alert.get("error_rate", 0) or 0
-        sev = "P1" if (rev > 1000 or err > 0.9) else (
-              "P2" if (rev > 100 or err > 0.3) else "P3")
+        sev = ("P1" if (rev > 1000 or err > 0.9) else
+               ("P2" if (rev > 100 or err > 0.3) else "P3"))
         svc = (alert.get("affected_services") or known or ["unknown"])[0]
-        return {
-            "action_type": "submit_severity",
-            "parameters": {"severity": sev, "service": svc},
-        }
+        return {"action_type": "submit_severity",
+                "parameters": {"severity": sev, "service": svc}}
 
     if task_id == "root_cause_analysis":
         svc = known[0] if known else "unknown"
-        return {
-            "action_type": "submit_root_cause",
-            "parameters": {
-                "service": svc,
-                "failure_mode": "service failure causing downstream cascade",
-            },
-        }
+        return {"action_type": "submit_root_cause",
+                "parameters": {"service": svc,
+                               "failure_mode": "service failure causing cascade"}}
 
-    # remediation_planning
-    return {
-        "action_type": "submit_resolution",
-        "parameters": {
-            "summary": (
-                "The incident was investigated through log and metric analysis "
-                "across affected services. Remediation actions were applied to "
-                "restore service health. Systems are being monitored for full "
-                "recovery confirmation."
-            ),
-        },
-    }
+    return {"action_type": "submit_resolution",
+            "parameters": {"summary": (
+                "The incident was investigated through log and metric analysis. "
+                "Remediation actions were applied to restore service health. "
+                "Systems are being monitored for recovery confirmation."
+            )}}
 
 
-def _smart_fallback(
-    task_id: str, obs: dict, step: int, max_steps: int
-) -> dict:
-    """Generic fallback — queries unvisited services, then submits."""
-    known   = obs.get("known_services", [])
+def _smart_fallback(task_id: str, obs: dict, step: int, max_steps: int) -> dict:
+    known = obs.get("known_services", [])
     queried = obs.get("queried_data", {})
-    left    = max_steps - step
-    q_svcs  = _queried_svcs(queried)
+    left = max_steps - step
+    q_svcs = _queried_svcs(queried)
 
-    # Must submit on final step
     if left <= 1:
         return _fallback_submit(task_id, obs)
 
-    # Alert classification — submit after any query
     if task_id == "alert_classification" and q_svcs:
         return _fallback_submit(task_id, obs)
 
-    # Query next un-queried service
+    # Query logs on unvisited services first
     for svc in known:
         if svc not in q_svcs:
-            return {
-                "action_type": "query_logs",
-                "parameters": {"service": svc},
-            }
+            return {"action_type": "query_logs",
+                    "parameters": {"service": svc}}
 
-    # Try check_recent_deploys for unvisited services
+    # Then try check_recent_deploys (will now work since we queried logs)
     if task_id in ("root_cause_analysis", "remediation_planning"):
         deploy_queried = set(queried.get("check_recent_deploys", {}).keys())
         for svc in known:
             if svc not in deploy_queried:
-                return {
-                    "action_type": "check_recent_deploys",
-                    "parameters": {"service": svc},
-                }
+                return {"action_type": "check_recent_deploys",
+                        "parameters": {"service": svc}}
 
-    # Everything queried — submit
     return _fallback_submit(task_id, obs)
 
 
-# ── Override — ONLY blocks clearly invalid actions ──────────────────────────
 def _should_override(
     task_id: str, action: dict, obs: dict, step: int, max_steps: int
 ) -> bool:
-    at     = action.get("action_type", "")
+    at = action.get("action_type", "")
     params = action.get("parameters", {})
-    left   = max_steps - step
-    known  = obs.get("known_services", [])
+    left = max_steps - step
+    known = obs.get("known_services", [])
 
-    # 1. Unknown action type
     if at not in _ALL_VALID:
         return True
-
-    # 2. Must submit on last step
     if left <= 0 and at not in _SUBMIT_TYPES:
         return True
 
-    # 3. WRONG submission type for the task
-    #    e.g. submit_severity during remediation_planning
     correct_submit = _TASK_SUBMIT.get(task_id)
     if at in _SUBMIT_TYPES and at != correct_submit:
         return True
 
-    # 4. Service not in known_services (for service-targeted actions)
     svc = (params.get("service") or "").strip()
     if (svc and known
             and at not in ("disable_feature_flag", "execute_runbook_step")
             and svc not in known):
         return True
 
-    # 5. Invalid severity value
     if at == "submit_severity":
         sev = (params.get("severity") or "").upper().strip()
         if sev not in ("P1", "P2", "P3", "P4"):
             return True
 
-    # 6. Empty required fields
     if at == "submit_root_cause":
-        svc  = (params.get("service") or "").strip()
+        svc = (params.get("service") or "").strip()
         mode = (params.get("failure_mode") or "").strip()
         if not svc or len(mode) < 5:
             return True
@@ -400,14 +364,40 @@ def _should_override(
         if len(summary) < 30:
             return True
 
-    # 7. Remediation action used in alert_classification task
     if task_id == "alert_classification" and at in _REM_TYPES:
         return True
 
     return False
 
 
-# ── Episode runner ──────────────────────────────────────────────────────────
+def _llm_call_with_retry(messages: list, max_retries: int = 2) -> str:
+    """Call LLM with retry on rate limit errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            resp = _get_client().chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=300,
+                stream=False,
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            err_str = str(e).lower()
+            if "rate_limit" in err_str or "429" in err_str:
+                if attempt < max_retries:
+                    # Parse wait time from error or use default
+                    wait = 10 * (attempt + 1)
+                    print(f"  [RATE LIMIT] waiting {wait}s (attempt {attempt + 1})",
+                          file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+            if attempt == max_retries:
+                print(f"  [WARN] LLM call failed: {e}", file=sys.stderr)
+                return ""
+    return ""
+
+
 def _run_episode(task_id: str, scenario_index: int) -> float:
     r = _session.post(
         f"{ENV_BASE_URL}/reset",
@@ -428,24 +418,9 @@ def _run_episode(task_id: str, scenario_index: int) -> float:
     for step_i in range(max_steps):
         current_step = step_i + 1
 
-        # ── Call LLM ─────────────────────────────────────────────────────
-        try:
-            resp = _get_client().chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=0.0,
-                max_tokens=300,
-                stream=False,
-            )
-            raw = resp.choices[0].message.content or ""
-        except Exception as e:
-            print(f"  [WARN] LLM call failed step {current_step}: {e}",
-                  file=sys.stderr)
-            raw = ""
-
+        raw = _llm_call_with_retry(messages)
         messages.append({"role": "assistant", "content": raw or "{}"})
 
-        # ── Parse ────────────────────────────────────────────────────────
         action = None
         try:
             if raw.strip():
@@ -453,7 +428,6 @@ def _run_episode(task_id: str, scenario_index: int) -> float:
         except Exception:
             pass
 
-        # ── Fallback / override ──────────────────────────────────────────
         if action is None:
             action = _smart_fallback(task_id, obs, current_step, max_steps)
             print(f"  [FALLBACK] step {current_step}: "
@@ -462,15 +436,11 @@ def _run_episode(task_id: str, scenario_index: int) -> float:
             old_at = action.get("action_type")
             action = _smart_fallback(task_id, obs, current_step, max_steps)
             print(f"  [OVERRIDE] step {current_step}: "
-                  f"{old_at} -> {action.get('action_type')}",
-                  file=sys.stderr)
+                  f"{old_at} -> {action.get('action_type')}", file=sys.stderr)
 
-        # ── Step ─────────────────────────────────────────────────────────
-        sr = _session.post(
-            f"{ENV_BASE_URL}/step", json=action, timeout=30,
-        )
+        sr = _session.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
         sr.raise_for_status()
-        result  = sr.json()
+        result = sr.json()
         new_obs = result["observation"]
 
         print(
@@ -492,7 +462,6 @@ def _run_episode(task_id: str, scenario_index: int) -> float:
         }
         obs = new_obs
 
-        # Keep conversation window manageable
         if len(messages) > 20:
             messages = messages[:2] + messages[-16:]
 
@@ -501,15 +470,17 @@ def _run_episode(task_id: str, scenario_index: int) -> float:
     return g.json().get("total", 0.0)
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────
 def main():
     runs = [
         ("alert_classification",  0),
         ("alert_classification",  1),
+        ("alert_classification",  2),
         ("root_cause_analysis",   0),
         ("root_cause_analysis",   1),
+        ("root_cause_analysis",   2),
         ("remediation_planning",  0),
         ("remediation_planning",  1),
+        ("remediation_planning",  2),
     ]
 
     results: dict[str, list[float]] = {}
@@ -530,9 +501,7 @@ def main():
         results.setdefault(task_id, []).append(score)
 
     print("-" * 50)
-    summary = {
-        t: round(sum(v) / len(v), 4) for t, v in results.items()
-    }
+    summary = {t: round(sum(v) / len(v), 4) for t, v in results.items()}
     summary["overall"] = round(sum(summary.values()) / len(summary), 4)
 
     print("\nScore Summary:")

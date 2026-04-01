@@ -4,11 +4,11 @@ app_port: 7860
 description: >
   OpenEnv environment simulating real-world cloud SRE on-call incident response.
   Distinct from Kubernetes ops — focuses on cross-service cascading failures,
-  network partitions, OOM kills, and CDN storms across distributed systems.
-  An AI agent classifies alert severity, performs root cause analysis through
-  log/metric/dependency queries, and executes remediation sequences to resolve
-  production incidents end-to-end.
-author: Elliot89
+  network partitions, OOM kills, credential rotation failures, and CDN storms
+  across distributed systems. An AI agent classifies alert severity, performs
+  root cause analysis through log/metric/dependency queries, and executes
+  remediation sequences to resolve production incidents end-to-end.
+author: Einstein_Sidra
 license: MIT
 tags:
   - openenv
@@ -28,6 +28,7 @@ tasks:
     description: >
       Classify incoming alert severity (P1-P4) by querying
       logs and metrics across affected cloud services.
+      Target baseline: 0.75-1.0 with 8B model.
 
   - id: root_cause_analysis
     name: "Task 2: Root Cause Analysis"
@@ -37,7 +38,8 @@ tasks:
     description: >
       Trace a live incident through logs, metrics, dependencies,
       and recent deploys to identify the exact root cause service
-      and failure mode across a distributed system.
+      and failure mode. Root cause is NOT in the alert.
+      Target baseline: 0.35-0.60 with 8B model.
 
   - id: remediation_planning
     name: "Task 3: Incident Remediation"
@@ -46,8 +48,9 @@ tasks:
     score_range: [0.0, 1.0]
     description: >
       Fully resolve a production incident end-to-end: diagnose
-      the root cause, execute the correct remediation sequence,
-      and submit a documented resolution summary.
+      the root cause, execute the correct multi-step remediation
+      sequence, and submit a documented resolution summary.
+      Wrong actions penalized. Target baseline: 0.20-0.45 with 8B model.
 
 endpoints:
   health:   "GET /health"

@@ -5,6 +5,11 @@ Public API:
     grade(task_id, state, scenario) -> {"total": float, "breakdown": dict, "feedback": str}
 
 All scores are in [0.0, 1.0].
+
+Grading Philosophy:
+  - Easy task: binary-ish — did you get the severity right?
+  - Medium task: partial credit for correct service, bonus for efficiency
+  - Hard task: multi-component — base + efficiency − penalties + summary quality
 """
 
 from __future__ import annotations
@@ -33,6 +38,16 @@ def _svc_match(submitted: str, correct: str) -> bool:
         "auth": "auth-service",
         "api": "api-gateway",
         "api-gw": "api-gateway",
+        "fraud": "fraud-detection-service",
+        "fraud-detection": "fraud-detection-service",
+        "order": "order-service",
+        "orders": "order-service",
+        "image": "image-service",
+        "images": "image-service",
+        "product": "product-service",
+        "products": "product-service",
+        "redis": "redis-session",
+        "redis-cache": "redis-payment-cache",
     }
     return aliases.get(s, s) == c or s == aliases.get(c, c)
 
@@ -45,11 +60,27 @@ def grade(task_id: str, state: dict, scenario: dict) -> dict:
     }
     fn = _graders.get(task_id)
     if fn is None:
-        return {"total": 0.0, "breakdown": {}, "feedback": f"Unknown task_id '{task_id}'"}
+        return {
+            "total": 0.0,
+            "breakdown": {},
+            "feedback": f"Unknown task_id '{task_id}'",
+        }
     return fn(state, scenario)
 
 
-# ── Task 1: Alert Classification ─────────────────────────────────────────────
+# ── Task 1: Alert Classification (Easy) ──────────────────────────────────────
+#
+# Scoring:
+#   1.0  — exact severity match
+#   0.5  — adjacent severity (e.g. P1 vs P2)
+#   0.25 — two levels off (e.g. P1 vs P3)
+#   0.0  — wrong by 3+ levels or no submission
+#
+# This is genuinely EASY: with 3 steps, an agent queries 1–2 services,
+# reads the error_rate + revenue_impact, and classifies. The data is
+# unambiguous — the correct answer is clearly derivable from the alert.
+
+
 def _grade_alert_classification(state: dict, scenario: dict) -> dict:
     history = state.get("action_history", [])
     correct = scenario.get("correct_severity", "P1")
@@ -92,7 +123,23 @@ def _grade_alert_classification(state: dict, scenario: dict) -> dict:
     }
 
 
-# ── Task 2: Root Cause Analysis ──────────────────────────────────────────────
+# ── Task 2: Root Cause Analysis (Medium) ─────────────────────────────────────
+#
+# Scoring (total up to 1.0):
+#   Base (up to 0.6):
+#     0.60 — correct service AND failure mode keywords match
+#     0.35 — correct service only
+#     0.10 — wrong service (partial credit for at least submitting)
+#   Efficiency bonus (up to 0.4):
+#     Based on investigation precision: queried relevant services / total queries
+#     Plus bonus for breadth of investigation (up to 3 unique known services)
+#
+# This is genuinely MEDIUM: the root cause is NOT in the alert's
+# affected_services list. The agent must investigate services outside
+# the blast radius, correlate log evidence, and identify the upstream
+# trigger — this requires multi-hop reasoning across 4–6 services.
+
+
 def _grade_root_cause_analysis(state: dict, scenario: dict) -> dict:
     history = state.get("action_history", [])
     correct_rc = scenario.get("correct_root_cause", {})
@@ -101,8 +148,11 @@ def _grade_root_cause_analysis(state: dict, scenario: dict) -> dict:
     known = {s.lower() for s in scenario.get("known_services", set())}
 
     diag_types = {
-        "query_logs", "check_metrics", "check_dependencies",
-        "check_recent_deploys", "check_service_status",
+        "query_logs",
+        "check_metrics",
+        "check_dependencies",
+        "check_recent_deploys",
+        "check_service_status",
     }
 
     sub_svc, sub_mode, sub_step = "", "", len(history)
@@ -139,12 +189,12 @@ def _grade_root_cause_analysis(state: dict, scenario: dict) -> dict:
     efficiency = 0.0
     if svc_match:
         pre_submit = [
-            a for a in history[:sub_step]
+            a
+            for a in history[: sub_step]
             if a.get("action_type") in diag_types
         ]
         queried_svcs = {
-            a.get("parameters", {}).get("service", "").lower()
-            for a in pre_submit
+            a.get("parameters", {}).get("service", "").lower() for a in pre_submit
         }
         relevant = queried_svcs & known
         total_q = len(pre_submit)
@@ -169,7 +219,26 @@ def _grade_root_cause_analysis(state: dict, scenario: dict) -> dict:
     }
 
 
-# ── Task 3: Remediation Planning ─────────────────────────────────────────────
+# ── Task 3: Remediation Planning (Hard) ──────────────────────────────────────
+#
+# Scoring (total up to 1.0):
+#   Base (0.6 if submitted with any investigation):
+#     Requires at least 1 diagnostic/remediation action + a summary
+#   Efficiency bonus (up to 0.3):
+#     Fraction of correct_remediation_sequence steps matched
+#   Wrong action penalty (up to -0.15):
+#     −0.05 per wrong action taken (capped at 3)
+#   Summary quality bonus (up to 0.10):
+#     Based on keyword coverage in the resolution summary
+#
+# This is genuinely HARD: requires multi-phase execution:
+#   Phase 1: Diagnose (query logs to confirm root cause)
+#   Phase 2: Remediate (execute 3–5 specific actions in order)
+#   Phase 3: Document (write a coherent summary with key details)
+# Wrong remediation actions actively harm the score. The sequence
+# matters. The summary must reference specific services and actions.
+
+
 def _grade_remediation_planning(state: dict, scenario: dict) -> dict:
     history = state.get("action_history", [])
     correct_seq = scenario.get("correct_remediation_sequence", [])
@@ -177,10 +246,17 @@ def _grade_remediation_planning(state: dict, scenario: dict) -> dict:
     keywords = scenario.get("resolution_keywords", [])
 
     diag_rem = {
-        "query_logs", "check_metrics", "check_dependencies",
-        "check_recent_deploys", "check_service_status",
-        "restart_service", "rollback_deploy", "scale_service",
-        "disable_feature_flag", "clear_cache", "execute_runbook_step",
+        "query_logs",
+        "check_metrics",
+        "check_dependencies",
+        "check_recent_deploys",
+        "check_service_status",
+        "restart_service",
+        "rollback_deploy",
+        "scale_service",
+        "disable_feature_flag",
+        "clear_cache",
+        "execute_runbook_step",
     }
 
     summary = ""
@@ -195,8 +271,10 @@ def _grade_remediation_planning(state: dict, scenario: dict) -> dict:
         return {
             "total": 0.0,
             "breakdown": {
-                "base": 0.0, "efficiency": 0.0,
-                "penalty": 0.0, "summary_bonus": 0.0,
+                "base": 0.0,
+                "efficiency": 0.0,
+                "penalty": 0.0,
+                "summary_bonus": 0.0,
             },
             "feedback": "No resolution submitted or no investigation — score 0.0",
         }
@@ -212,10 +290,14 @@ def _grade_remediation_planning(state: dict, scenario: dict) -> dict:
         runbook = p.get("runbook_action", "")
         target = p.get("target", "")
         executed.add(at)
-        if svc:     executed.add(f"{at}:{svc}")
-        if flag:    executed.add(f"{at}:{flag}")
-        if runbook: executed.add(f"execute_runbook_step:{runbook}")
-        if target:  executed.add(f"execute_runbook_step:{target}")
+        if svc:
+            executed.add(f"{at}:{svc}")
+        if flag:
+            executed.add(f"{at}:{flag}")
+        if runbook:
+            executed.add(f"execute_runbook_step:{runbook}")
+        if target:
+            executed.add(f"execute_runbook_step:{target}")
 
     def _seq_key_matches(seq_key: str) -> bool:
         if seq_key in executed:
@@ -230,13 +312,18 @@ def _grade_remediation_planning(state: dict, scenario: dict) -> dict:
         return False
 
     matched = sum(1 for k in correct_seq if _seq_key_matches(k))
-    efficiency = round((matched / len(correct_seq)) * 0.3, 4) if correct_seq else 0.0
+    efficiency = (
+        round((matched / len(correct_seq)) * 0.3, 4) if correct_seq else 0.0
+    )
 
     wrong_count = sum(
-        1 for a in history
-        if (a.get("action_type") in wrong_map or
-            f"{a.get('action_type')}:{a.get('parameters', {}).get('service', '')}"
-            in wrong_map)
+        1
+        for a in history
+        if (
+            a.get("action_type") in wrong_map
+            or f"{a.get('action_type')}:{a.get('parameters', {}).get('service', '')}"
+            in wrong_map
+        )
     )
     penalty = round(min(0.15, wrong_count * 0.05), 4)
 
