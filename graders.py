@@ -182,8 +182,20 @@ def _grade_root_cause_analysis(state: dict, scenario: dict) -> dict:
     elif svc_match:
         base, base_fb = 0.35, "Correct service only — failure mode unclear"
     else:
-        base, base_fb = 0.10, (
-            f"Wrong service: '{sub_svc}' (correct: '{correct_svc}') — partial credit"
+        # Give MORE partial credit for investigation effort even with wrong answer
+        pre_submit_diag = [
+            a for a in history[:sub_step]
+            if a.get("action_type") in diag_types
+        ]
+        investigated = len({
+            a.get("parameters", {}).get("service", "").lower()
+            for a in pre_submit_diag
+        } - {""})
+        # 0.05 base + up to 0.15 for investigating 3+ services
+        wrong_base = min(0.20, 0.05 + investigated * 0.05)
+        base, base_fb = wrong_base, (
+            f"Wrong service: '{sub_svc}' (correct: '{correct_svc}') — "
+            f"investigated {investigated} services"
         )
 
     efficiency = 0.0
@@ -279,7 +291,22 @@ def _grade_remediation_planning(state: dict, scenario: dict) -> dict:
             "feedback": "No resolution submitted or no investigation — score 0.0",
         }
 
-    base = 0.6
+    # Base scales with investigation depth — not a free 0.60
+    diag_count = sum(
+        1 for a in history if a.get("action_type") in {
+            "query_logs", "check_metrics", "check_dependencies",
+            "check_recent_deploys", "check_service_status",
+        }
+    )
+    rem_count = sum(
+        1 for a in history if a.get("action_type") in {
+            "restart_service", "rollback_deploy", "scale_service",
+            "disable_feature_flag", "clear_cache", "execute_runbook_step",
+        }
+    )
+    diag_credit = min(0.20, diag_count * 0.05)
+    rem_credit = min(0.20, rem_count * 0.05)
+    base = round(0.10 + diag_credit + rem_credit, 4)
 
     executed = set()
     for a in history:
@@ -325,7 +352,8 @@ def _grade_remediation_planning(state: dict, scenario: dict) -> dict:
             in wrong_map
         )
     )
-    penalty = round(min(0.15, wrong_count * 0.05), 4)
+    penalty = round(min(0.30, wrong_count * 0.10), 4)
+
 
     sl = summary.lower()
     hits = sum(1 for kw in keywords if kw in sl)

@@ -8,7 +8,11 @@ description: >
   across distributed systems. An AI agent classifies alert severity, performs
   root cause analysis through log/metric/dependency queries, and executes
   remediation sequences to resolve production incidents end-to-end.
-author: Einstein_Sidra
+authors:
+  - name: "Einstein"
+    github: "MrEinsteinE"
+  - name: "Sidra"
+    github: "sidraaiman"
 license: MIT
 tags:
   - openenv
@@ -60,3 +64,6 @@ endpoints:
   tasks:    "GET /tasks"
   grader:   "GET /grader"
   baseline: "POST /baseline"
+
+repo: "https://github.com/MrEinsteinE/cloud-incident-response-openenv"
+space: "https://huggingface.co/spaces/Elliot89/cloud-incident-response"

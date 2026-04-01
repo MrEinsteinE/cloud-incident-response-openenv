@@ -250,7 +250,7 @@ class IncidentEnvironment:
         svc = (params.service or "").lower().strip()
         flag = (params.flag or "").lower().strip()
         runbook = (params.runbook_action or "").lower().strip()
-        target = (params.target or "").lower().strip()
+        target = (params.target or params.target_version or "").lower().strip()
 
         if not (svc or flag or runbook or target):
             r += rt["rem_no_target"]

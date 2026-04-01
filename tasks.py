@@ -373,12 +373,13 @@ SCENARIOS: dict = {
                         # In RCA-001, replace the query_logs section:
         "query_logs": {
             "postgres-db": (
-                "2024-03-16T02:11:00Z LOG database system shut down\n"
-                "2024-03-16T02:10:58Z FATAL terminated by kernel OOM killer\n"
-                "2024-03-16T02:10:30Z LOG long-running query from "
-                "analytics-service consuming all available memory — "
-                "running for 12 minutes, no LIMIT clause"
-            ),
+    "2024-03-16T02:11:00Z LOG database system shut down\n"
+    "2024-03-16T02:10:58Z FATAL terminated by kernel OOM killer\n"
+    "2024-03-16T02:10:30Z LOG long-running analytics export query "
+    "consuming 31.8GB/32GB — sequential scan on events table "
+    "with cross-join, running 12 minutes, no LIMIT clause. "
+    "Investigate analytics-service scheduled jobs"
+),
             "analytics-service": (
                 "2024-03-16T01:58:00Z INFO starting scheduled job: full_history_export\n"
                 "2024-03-16T01:58:01Z DEBUG executing: SELECT * FROM events "
@@ -678,18 +679,20 @@ SCENARIOS: dict = {
                         # In RCA-003, replace query_logs:
         "query_logs": {
             "user-service": (
-                "2024-03-18T08:14:00Z FATAL password authentication failed "
-                "for user 'app_user'\n"
-                "2024-03-18T08:14:01Z ERROR DB credentials rejected — "
-                "credentials were pushed by config-service at 08:12:00Z\n"
-                "2024-03-18T08:14:02Z WARN config-service credential rotation "
-                "may have sent wrong credentials"
-            ),
+    "2024-03-18T08:14:00Z FATAL password authentication failed "
+    "for user 'app_user'\n"
+    "2024-03-18T08:14:01Z ERROR DB credentials rejected — "
+    "credentials were last pushed by config-service secrets "
+    "rotation at 08:12:00Z\n"
+    "2024-03-18T08:14:02Z WARN credential hash mismatch — "
+    "check config-service rotation job for issues"
+),
             "notification-service": (
-                "2024-03-18T08:14:05Z FATAL password authentication failed\n"
-                "2024-03-18T08:14:06Z WARN credentials from config-service "
-                "push at 08:12:00Z appear to be stale/invalid"
-            ),
+    "2024-03-18T08:14:05Z FATAL password authentication failed "
+    "for user 'app_user'\n"
+    "2024-03-18T08:14:06Z WARN credentials from config-service "
+    "rotation at 08:12:00Z appear invalid"
+),
             "api-gateway": (
                 "2024-03-18T08:14:10Z ERROR upstream user-service: 503\n"
                 "2024-03-18T08:14:11Z ERROR upstream notification-service: 503"
@@ -842,10 +845,12 @@ SCENARIOS: dict = {
             },
             "tool_responses": {
                 "query_logs": {
-                    "postgres-db": (
-                        "FATAL: terminated by kernel OOM killer — "
-                        "query from client 10.0.5.47 running 12min consuming all memory"
-                    ),
+                    # RP-001 query_logs → postgres-db — REPLACE WITH:
+"postgres-db": (
+    "FATAL: terminated by kernel OOM killer — "
+    "query from client 10.0.5.47 running 12min consuming "
+    "31.8GB of 32GB available memory"
+),
                     "analytics-service": (
                         "INFO: starting job full_history_export\n"
                         "WARN: query plan: 847M rows, cross-table JOIN, no LIMIT\n"
@@ -1102,14 +1107,16 @@ SCENARIOS: dict = {
             "tool_responses": {
                 "query_logs": {
                     "user-service": (
-                        "FATAL: password authentication failed for user 'app_user'\n"
-                        "ERROR: DB credentials rejected\n"
-                        "WARN: credentials last refreshed at 08:12:00Z"
-                    ),
-                    "notification-service": (
-                        "FATAL: password authentication failed\n"
-                        "WARN: credentials from 08:12:00Z appear stale"
-                    ),
+    "FATAL: password authentication failed for user 'app_user'\n"
+    "ERROR: DB credentials rejected\n"
+    "WARN: credentials last refreshed at 08:12:00Z"
+),
+
+"notification-service": (
+    "FATAL: password authentication failed\n"
+    "WARN: credentials last refreshed at 08:12:00Z — "
+    "authentication rejected by postgres-db"
+),
                     "api-gateway": (
                         "ERROR: upstream user-service 503\n"
                         "ERROR: upstream notification-service 503"

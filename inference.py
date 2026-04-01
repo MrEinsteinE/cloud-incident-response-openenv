@@ -13,7 +13,13 @@ import sys
 import time
 
 import requests
+import time as _time
+_START = _time.time()
+_MAX_RUNTIME = 1080
 
+def _check_timeout():
+    if _time.time() - _START > _MAX_RUNTIME:
+        raise RuntimeError("Approaching 20min limit — stopping early")
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -23,10 +29,10 @@ except ImportError:
 # ── Config ──────────────────────────────────────────────────────────────────
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.groq.com/openai/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "llama-3.1-8b-instant")
-HF_TOKEN     = os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY") or ""
+API_KEY = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY") or ""
 ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "http://localhost:7860")
 
-if not HF_TOKEN:
+if not API_KEY:
     print("[WARN] No API key set — LLM calls will fail.", file=sys.stderr)
 
 _session = requests.Session()
@@ -37,7 +43,7 @@ def _get_client():
     global _client
     if _client is None:
         from openai import OpenAI
-        _client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+        _client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
     return _client
 
 
@@ -370,7 +376,7 @@ def _should_override(
     return False
 
 
-def _llm_call_with_retry(messages: list, max_retries: int = 2) -> str:
+def _llm_call_with_retry(messages: list, max_retries: int = 1) -> str:
     """Call LLM with retry on rate limit errors."""
     for attempt in range(max_retries + 1):
         try:
@@ -387,7 +393,7 @@ def _llm_call_with_retry(messages: list, max_retries: int = 2) -> str:
             if "rate_limit" in err_str or "429" in err_str:
                 if attempt < max_retries:
                     # Parse wait time from error or use default
-                    wait = 10 * (attempt + 1)
+                    wait = 5 * (attempt + 1)
                     print(f"  [RATE LIMIT] waiting {wait}s (attempt {attempt + 1})",
                           file=sys.stderr)
                     time.sleep(wait)
@@ -399,6 +405,12 @@ def _llm_call_with_retry(messages: list, max_retries: int = 2) -> str:
 
 
 def _run_episode(task_id: str, scenario_index: int) -> float:
+    if _time.time() - _START > _MAX_RUNTIME:
+        print(f"  [TIMEOUT] Approaching 20min limit — skipping {task_id} s{scenario_index}",
+              file=sys.stderr)
+        return 0.0
+    _check_timeout()
+
     r = _session.post(
         f"{ENV_BASE_URL}/reset",
         params={"task_id": task_id, "scenario_index": scenario_index},
@@ -472,43 +484,190 @@ def _run_episode(task_id: str, scenario_index: int) -> float:
 
 def main():
     runs = [
-        ("alert_classification",  0),
-        ("alert_classification",  1),
-        ("alert_classification",  2),
-        ("root_cause_analysis",   0),
-        ("root_cause_analysis",   1),
-        ("root_cause_analysis",   2),
-        ("remediation_planning",  0),
-        ("remediation_planning",  1),
-        ("remediation_planning",  2),
+        ("alert_classification", 0),
+        ("alert_classification", 1),
+        ("alert_classification", 2),
+        ("root_cause_analysis", 0),
+        ("root_cause_analysis", 1),
+        ("root_cause_analysis", 2),
+        ("remediation_planning", 0),
+        ("remediation_planning", 1),
+        ("remediation_planning", 2),
     ]
 
-    results: dict[str, list[float]] = {}
+    _DIFFICULTY = {
+        "alert_classification": "🟢 Easy",
+        "root_cause_analysis": "🟡 Medium",
+        "remediation_planning": "🔴 Hard",
+    }
 
-    print(f"{'Task':<36} {'S':>2}  {'Score':>7}")
-    print("-" * 50)
+    _MAX_STEPS = {
+        "alert_classification": 3,
+        "root_cause_analysis": 10,
+        "remediation_planning": 15,
+    }
+
+    results: dict[str, list[dict]] = {}
+
+    print()
+    print("=" * 100)
+    print("  ☁️  CLOUD INCIDENT RESPONSE — BASELINE INFERENCE")
+    print("=" * 100)
+    print(f"  Model:    {MODEL_NAME}")
+    print(f"  Endpoint: {API_BASE_URL}")
+    print("=" * 100)
+    print()
+
+    # Table header
+    print(f"{'Task':<24} {'Difficulty':<12} {'Scenario':>8} {'Steps':>10} {'Actions':>10} {'Reward':>10} {'Score':>10}")
+    print("─" * 100)
 
     for task_id, scenario_index in runs:
         try:
-            score = _run_episode(task_id, scenario_index)
+            score, steps_used, actions_taken, cumulative_reward = _run_episode_detailed(task_id, scenario_index)
         except Exception as e:
-            print(f"  [ERROR] {task_id} s{scenario_index}: {e}",
-                  file=sys.stderr)
-            score = 0.0
+            print(f"  [ERROR] {task_id} scenario {scenario_index}: {e}", file=sys.stderr)
+            score, steps_used, actions_taken, cumulative_reward = 0.0, 0, 0, 0.0
 
-        label = f"{task_id} [s{scenario_index}]"
-        print(f"{label:<36} {scenario_index:>2}  {score:>7.4f}")
-        results.setdefault(task_id, []).append(score)
+        difficulty = _DIFFICULTY.get(task_id, "?")
+        max_steps = _MAX_STEPS.get(task_id, "?")
+        steps_display = f"{steps_used}/{max_steps}"
 
-    print("-" * 50)
-    summary = {t: round(sum(v) / len(v), 4) for t, v in results.items()}
+        print(
+            f"{task_id:<24} {difficulty:<12} {scenario_index:>8} "
+            f"{steps_display:>10} {actions_taken:>10} {cumulative_reward:>+10.4f} {score:>10.4f}"
+        )
+
+        results.setdefault(task_id, []).append({
+            "scenario": scenario_index,
+            "score": score,
+            "steps": steps_used,
+            "actions": actions_taken,
+            "reward": cumulative_reward,
+        })
+
+    print("─" * 100)
+    print()
+
+    # Summary table
+    print("=" * 100)
+    print("  📊 SUMMARY BY TASK")
+    print("=" * 100)
+    print(f"{'Task':<24} {'Difficulty':<12} {'Avg Score':>10} {'Avg Steps':>10} {'Scenarios':>20}")
+    print("─" * 100)
+
+    summary = {}
+    for task_id in ["alert_classification", "root_cause_analysis", "remediation_planning"]:
+        if task_id not in results:
+            continue
+        data = results[task_id]
+        avg_score = sum(d["score"] for d in data) / len(data)
+        avg_steps = sum(d["steps"] for d in data) / len(data)
+        scenario_scores = " | ".join(f'{d["score"]:.2f}' for d in data)
+        difficulty = _DIFFICULTY.get(task_id, "?")
+
+        print(f"{task_id:<24} {difficulty:<12} {avg_score:>10.4f} {avg_steps:>10.1f} {scenario_scores:>20}")
+        summary[task_id] = round(avg_score, 4)
+
     summary["overall"] = round(sum(summary.values()) / len(summary), 4)
 
-    print("\nScore Summary:")
-    for k, v in summary.items():
-        print(f"  {k:<36}: {v:.4f}")
+    print("─" * 100)
+    print(f"{'OVERALL':<24} {'':12} {summary['overall']:>10.4f}")
+    print("=" * 100)
+    print()
 
+    # Difficulty progression check
+    easy = summary.get("alert_classification", 0)
+    med = summary.get("root_cause_analysis", 0)
+    hard = summary.get("remediation_planning", 0)
+
+    if easy > med > hard:
+        print("  ✅ Difficulty Progression: Easy (%.2f) > Medium (%.2f) > Hard (%.2f)" % (easy, med, hard))
+    elif easy > med and easy > hard:
+        print("  ⚠️  Difficulty Progression: Easy highest, Medium ≈ Hard")
+    else:
+        print("  ❌ Difficulty Progression: Unexpected order")
+    
+    print()
     print(json.dumps(summary))
+
+
+def _run_episode_detailed(task_id: str, scenario_index: int) -> tuple[float, int, int, float]:
+    """Run episode and return (score, steps_used, actions_taken, cumulative_reward)."""
+    r = _session.post(
+        f"{ENV_BASE_URL}/reset",
+        params={"task_id": task_id, "scenario_index": scenario_index},
+        timeout=30,
+    )
+    r.raise_for_status()
+    obs = r.json()
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": _first_obs_msg(obs)},
+    ]
+
+    prev_queried: dict = {}
+    max_steps = obs.get("max_steps", 10)
+    actions_taken = 0
+    cumulative_reward = 0.0
+
+    for step_i in range(max_steps):
+        current_step = step_i + 1
+
+        raw = _llm_call_with_retry(messages)
+        messages.append({"role": "assistant", "content": raw or "{}"})
+
+        action = None
+        try:
+            if raw.strip():
+                action = _parse(raw)
+        except Exception:
+            pass
+
+        if action is None:
+            action = _smart_fallback(task_id, obs, current_step, max_steps)
+            print(f"    [FALLBACK] step {current_step}: {action.get('action_type')}", file=sys.stderr)
+        elif _should_override(task_id, action, obs, current_step, max_steps):
+            old_at = action.get("action_type")
+            action = _smart_fallback(task_id, obs, current_step, max_steps)
+            print(f"    [OVERRIDE] step {current_step}: {old_at} -> {action.get('action_type')}", file=sys.stderr)
+
+        sr = _session.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
+        sr.raise_for_status()
+        result = sr.json()
+        new_obs = result["observation"]
+        
+        actions_taken += 1
+        step_reward = result['reward']['value']
+        cumulative_reward = result['reward'].get('cumulative', cumulative_reward + step_reward)
+
+        # Step detail output
+        print(
+            f"    step {current_step:>2}: {action.get('action_type'):<28} "
+            f"reward={step_reward:+.3f}  done={result['done']}"
+        )
+
+        if result.get("done"):
+            break
+
+        step_msg = _step_msg(new_obs, prev_queried)
+        messages.append({"role": "user", "content": step_msg})
+        prev_queried = {
+            k: dict(v)
+            for k, v in new_obs.get("queried_data", {}).items()
+            if isinstance(v, dict)
+        }
+        obs = new_obs
+
+        if len(messages) > 20:
+            messages = messages[:2] + messages[-16:]
+
+    g = _session.get(f"{ENV_BASE_URL}/grader", timeout=30)
+    g.raise_for_status()
+    score = g.json().get("total", 0.0)
+    
+    return score, current_step, actions_taken, cumulative_reward
 
 
 if __name__ == "__main__":

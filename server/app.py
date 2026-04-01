@@ -254,7 +254,15 @@ def baseline():
     except Exception:
         return {"raw_output": result.stdout[-3000:]}
 
-
+@app.get("/status")
+def root_status():
+    """Root health check — returns JSON."""
+    return {
+        "status": "running",
+        "name": "cloud-incident-response",
+        "version": "0.1.0",
+        "tasks": list(ALL_TASKS.keys()),
+    }
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 
 import gradio as gr
