@@ -1,8 +1,3 @@
-
-
-## `README.md`
-
-```markdown
 ---
 title: Cloud Incident Response OpenEnv
 emoji: 🚨
