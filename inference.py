@@ -554,14 +554,17 @@ def _run_episode_structured(task_id: str, scenario_index: int) -> tuple[float, i
                 flush=True,
             )
 
-    # ── [END] ── (always emitted, even on exception)
-    success_str = "true" if score > 0 else "false"
+        # ── [END] ── (always emitted, even on exception)
+    # Clamp score to open interval (0, 1) for validator compliance
+    score = max(0.01, min(0.99, score))
+    success_str = "true" if score > 0.01 else "false"
     rewards_str = ",".join(f"{rw:.2f}" for rw in rewards_list)
     print(
         f"[END] success={success_str} steps={steps_used} "
         f"score={score:.2f} rewards={rewards_str}",
         flush=True,
     )
+
 
     return score, steps_used, rewards_list
 
