@@ -3,6 +3,11 @@ inference.py — Cloud Incident Response OpenEnv baseline inference script.
 
 The LLM reasons from evidence. Fallback is a dumb safety net that scores low.
 Override only blocks clearly invalid actions (wrong task submission, bad params).
+
+STRUCTURED OUTPUT:
+  [START] task=<task_name> env=cloud-incident-response model=<model_name>
+  [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+  [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 """
 
 from __future__ import annotations
@@ -14,11 +19,11 @@ import time
 
 import requests
 import time as _time
-_START = _time.time()
+_START_TIME = _time.time()
 _MAX_RUNTIME = 1080
 
 def _check_timeout():
-    if _time.time() - _START > _MAX_RUNTIME:
+    if _time.time() - _START_TIME > _MAX_RUNTIME:
         raise RuntimeError("Approaching 20min limit — stopping early")
 try:
     from dotenv import load_dotenv
@@ -31,6 +36,7 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.groq.com/openai/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "llama-3.1-8b-instant")
 API_KEY = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY") or ""
 ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "http://localhost:7860")
+ENV_NAME = "cloud-incident-response"
 
 if not API_KEY:
     print("[WARN] No API key set — LLM calls will fail.", file=sys.stderr)
@@ -404,83 +410,163 @@ def _llm_call_with_retry(messages: list, max_retries: int = 1) -> str:
     return ""
 
 
-def _run_episode(task_id: str, scenario_index: int) -> float:
-    if _time.time() - _START > _MAX_RUNTIME:
-        print(f"  [TIMEOUT] Approaching 20min limit — skipping {task_id} s{scenario_index}",
-              file=sys.stderr)
-        return 0.0
-    _check_timeout()
+# ── Structured Output Helpers ───────────────────────────────────────────────
 
-    r = _session.post(
-        f"{ENV_BASE_URL}/reset",
-        params={"task_id": task_id, "scenario_index": scenario_index},
-        timeout=30,
-    )
-    r.raise_for_status()
-    obs = r.json()
+def _fmt_action(action: dict) -> str:
+    """Format action as a compact string for [STEP] output."""
+    at = action.get("action_type", "unknown")
+    params = action.get("parameters", {})
+    parts = []
+    for k, v in params.items():
+        if v is not None and v != "":
+            parts.append(f"{k}={v}")
+    if parts:
+        return f"{at}({', '.join(parts)})"
+    return at
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": _first_obs_msg(obs)},
-    ]
 
-    prev_queried: dict = {}
-    max_steps = obs.get("max_steps", 10)
+def _fmt_error(error_val) -> str:
+    """Format error for [STEP] output — return 'null' if no error."""
+    if error_val is None or error_val == "" or error_val == "null":
+        return "null"
+    # Sanitize: remove newlines to keep [STEP] on a single line
+    return str(error_val).replace("\n", " ").replace("\r", "")
 
-    for step_i in range(max_steps):
-        current_step = step_i + 1
 
-        raw = _llm_call_with_retry(messages)
-        messages.append({"role": "assistant", "content": raw or "{}"})
+# ── Episode Runner with Structured Output ───────────────────────────────────
 
-        action = None
-        try:
-            if raw.strip():
-                action = _parse(raw)
-        except Exception:
-            pass
+def _run_episode_structured(task_id: str, scenario_index: int) -> tuple[float, int, list[float]]:
+    """
+    Run a single episode with required [START]/[STEP]/[END] structured stdout output.
+    
+    Returns: (score, steps_used, rewards_list)
+    """
+    rewards_list: list[float] = []
+    steps_used = 0
+    score = 0.0
 
-        if action is None:
-            action = _smart_fallback(task_id, obs, current_step, max_steps)
-            print(f"  [FALLBACK] step {current_step}: "
-                  f"{action.get('action_type')}", file=sys.stderr)
-        elif _should_override(task_id, action, obs, current_step, max_steps):
-            old_at = action.get("action_type")
-            action = _smart_fallback(task_id, obs, current_step, max_steps)
-            print(f"  [OVERRIDE] step {current_step}: "
-                  f"{old_at} -> {action.get('action_type')}", file=sys.stderr)
+    # ── [START] ──
+    print(f"[START] task={task_id} env={ENV_NAME} model={MODEL_NAME}", flush=True)
 
-        sr = _session.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
-        sr.raise_for_status()
-        result = sr.json()
-        new_obs = result["observation"]
+    try:
+        _check_timeout()
 
-        print(
-            f"  step {current_step:>2}: {action.get('action_type'):<28} "
-            f"reward={result['reward']['value']:+.3f}  "
-            f"done={result['done']}",
-            file=sys.stderr,
+        # Reset environment
+        r = _session.post(
+            f"{ENV_BASE_URL}/reset",
+            params={"task_id": task_id, "scenario_index": scenario_index},
+            timeout=30,
         )
+        r.raise_for_status()
+        obs = r.json()
 
-        if result.get("done"):
-            break
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": _first_obs_msg(obs)},
+        ]
 
-        step_msg = _step_msg(new_obs, prev_queried)
-        messages.append({"role": "user", "content": step_msg})
-        prev_queried = {
-            k: dict(v)
-            for k, v in new_obs.get("queried_data", {}).items()
-            if isinstance(v, dict)
-        }
-        obs = new_obs
+        prev_queried: dict = {}
+        max_steps = obs.get("max_steps", 10)
 
-        if len(messages) > 20:
-            messages = messages[:2] + messages[-16:]
+        for step_i in range(max_steps):
+            current_step = step_i + 1
 
-    g = _session.get(f"{ENV_BASE_URL}/grader", timeout=30)
-    g.raise_for_status()
-    return g.json().get("total", 0.0)
+            # Get LLM action
+            raw = _llm_call_with_retry(messages)
+            messages.append({"role": "assistant", "content": raw or "{}"})
 
+            action = None
+            try:
+                if raw.strip():
+                    action = _parse(raw)
+            except Exception:
+                pass
+
+            if action is None:
+                action = _smart_fallback(task_id, obs, current_step, max_steps)
+                print(f"  [FALLBACK] step {current_step}: "
+                      f"{action.get('action_type')}", file=sys.stderr)
+            elif _should_override(task_id, action, obs, current_step, max_steps):
+                old_at = action.get("action_type")
+                action = _smart_fallback(task_id, obs, current_step, max_steps)
+                print(f"  [OVERRIDE] step {current_step}: "
+                      f"{old_at} -> {action.get('action_type')}", file=sys.stderr)
+
+            # Execute step
+            sr = _session.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
+            sr.raise_for_status()
+            result = sr.json()
+            new_obs = result["observation"]
+
+            step_reward = result["reward"]["value"]
+            done = result["done"]
+            error_raw = new_obs.get("last_action_error")
+
+            rewards_list.append(step_reward)
+            steps_used = current_step
+
+            # ── [STEP] ──
+            done_str = "true" if done else "false"
+            error_str = _fmt_error(error_raw)
+            action_str = _fmt_action(action)
+            print(
+                f"[STEP] step={current_step} action={action_str} "
+                f"reward={step_reward:.2f} done={done_str} error={error_str}",
+                flush=True,
+            )
+
+            # Debug to stderr
+            print(
+                f"    step {current_step:>2}: {action.get('action_type'):<28} "
+                f"reward={step_reward:+.3f}  done={done}",
+                file=sys.stderr,
+            )
+
+            if done:
+                break
+
+            step_msg = _step_msg(new_obs, prev_queried)
+            messages.append({"role": "user", "content": step_msg})
+            prev_queried = {
+                k: dict(v)
+                for k, v in new_obs.get("queried_data", {}).items()
+                if isinstance(v, dict)
+            }
+            obs = new_obs
+
+            if len(messages) > 20:
+                messages = messages[:2] + messages[-16:]
+
+        # Grade
+        g = _session.get(f"{ENV_BASE_URL}/grader", timeout=30)
+        g.raise_for_status()
+        score = g.json().get("total", 0.0)
+
+    except Exception as e:
+        print(f"  [ERROR] {task_id} scenario {scenario_index}: {e}", file=sys.stderr)
+        # If we haven't emitted any steps yet, emit a failure step
+        if steps_used == 0:
+            steps_used = 1
+            rewards_list.append(0.0)
+            print(
+                f"[STEP] step=1 action=error reward=0.00 done=true "
+                f"error={_fmt_error(str(e))}",
+                flush=True,
+            )
+
+    # ── [END] ── (always emitted, even on exception)
+    success_str = "true" if score > 0 else "false"
+    rewards_str = ",".join(f"{rw:.2f}" for rw in rewards_list)
+    print(
+        f"[END] success={success_str} steps={steps_used} "
+        f"score={score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
+
+    return score, steps_used, rewards_list
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
     runs = [
@@ -501,60 +587,43 @@ def main():
         "remediation_planning": "🔴 Hard",
     }
 
-    _MAX_STEPS = {
-        "alert_classification": 3,
-        "root_cause_analysis": 10,
-        "remediation_planning": 15,
-    }
-
     results: dict[str, list[dict]] = {}
 
-    print()
-    print("=" * 100)
-    print("  ☁️  CLOUD INCIDENT RESPONSE — BASELINE INFERENCE")
-    print("=" * 100)
-    print(f"  Model:    {MODEL_NAME}")
-    print(f"  Endpoint: {API_BASE_URL}")
-    print("=" * 100)
-    print()
-
-    # Table header
-    print(f"{'Task':<24} {'Difficulty':<12} {'Scenario':>8} {'Steps':>10} {'Actions':>10} {'Reward':>10} {'Score':>10}")
-    print("─" * 100)
+    # Banner to stderr (not stdout — structured output only on stdout)
+    print("", file=sys.stderr)
+    print("=" * 100, file=sys.stderr)
+    print("  ☁️  CLOUD INCIDENT RESPONSE — BASELINE INFERENCE", file=sys.stderr)
+    print("=" * 100, file=sys.stderr)
+    print(f"  Model:    {MODEL_NAME}", file=sys.stderr)
+    print(f"  Endpoint: {API_BASE_URL}", file=sys.stderr)
+    print("=" * 100, file=sys.stderr)
+    print("", file=sys.stderr)
 
     for task_id, scenario_index in runs:
-        try:
-            score, steps_used, actions_taken, cumulative_reward = _run_episode_detailed(task_id, scenario_index)
-        except Exception as e:
-            print(f"  [ERROR] {task_id} scenario {scenario_index}: {e}", file=sys.stderr)
-            score, steps_used, actions_taken, cumulative_reward = 0.0, 0, 0, 0.0
+        score, steps_used, rewards_list = _run_episode_structured(task_id, scenario_index)
 
         difficulty = _DIFFICULTY.get(task_id, "?")
-        max_steps = _MAX_STEPS.get(task_id, "?")
-        steps_display = f"{steps_used}/{max_steps}"
+        cumulative_reward = sum(rewards_list)
 
+        # Summary per episode to stderr
         print(
-            f"{task_id:<24} {difficulty:<12} {scenario_index:>8} "
-            f"{steps_display:>10} {actions_taken:>10} {cumulative_reward:>+10.4f} {score:>10.4f}"
+            f"  {task_id:<24} {difficulty:<12} scenario={scenario_index} "
+            f"steps={steps_used} reward={cumulative_reward:+.4f} score={score:.4f}",
+            file=sys.stderr,
         )
 
         results.setdefault(task_id, []).append({
             "scenario": scenario_index,
             "score": score,
             "steps": steps_used,
-            "actions": actions_taken,
             "reward": cumulative_reward,
         })
 
-    print("─" * 100)
-    print()
-
-    # Summary table
-    print("=" * 100)
-    print("  📊 SUMMARY BY TASK")
-    print("=" * 100)
-    print(f"{'Task':<24} {'Difficulty':<12} {'Avg Score':>10} {'Avg Steps':>10} {'Scenarios':>20}")
-    print("─" * 100)
+    # Summary to stderr
+    print("", file=sys.stderr)
+    print("=" * 100, file=sys.stderr)
+    print("  📊 SUMMARY BY TASK", file=sys.stderr)
+    print("=" * 100, file=sys.stderr)
 
     summary = {}
     for task_id in ["alert_classification", "root_cause_analysis", "remediation_planning"]:
@@ -562,112 +631,23 @@ def main():
             continue
         data = results[task_id]
         avg_score = sum(d["score"] for d in data) / len(data)
-        avg_steps = sum(d["steps"] for d in data) / len(data)
         scenario_scores = " | ".join(f'{d["score"]:.2f}' for d in data)
         difficulty = _DIFFICULTY.get(task_id, "?")
 
-        print(f"{task_id:<24} {difficulty:<12} {avg_score:>10.4f} {avg_steps:>10.1f} {scenario_scores:>20}")
+        print(f"  {task_id:<24} {difficulty:<12} avg={avg_score:.4f}  [{scenario_scores}]",
+              file=sys.stderr)
         summary[task_id] = round(avg_score, 4)
 
-    summary["overall"] = round(sum(summary.values()) / len(summary), 4)
-
-    print("─" * 100)
-    print(f"{'OVERALL':<24} {'':12} {summary['overall']:>10.4f}")
-    print("=" * 100)
-    print()
-
-    # Difficulty progression check
-    easy = summary.get("alert_classification", 0)
-    med = summary.get("root_cause_analysis", 0)
-    hard = summary.get("remediation_planning", 0)
-
-    if easy > med > hard:
-        print("  ✅ Difficulty Progression: Easy (%.2f) > Medium (%.2f) > Hard (%.2f)" % (easy, med, hard))
-    elif easy > med and easy > hard:
-        print("  ⚠️  Difficulty Progression: Easy highest, Medium ≈ Hard")
+    if summary:
+        summary["overall"] = round(sum(summary.values()) / len(summary), 4)
     else:
-        print("  ❌ Difficulty Progression: Unexpected order")
-    
-    print()
-    print(json.dumps(summary))
+        summary["overall"] = 0.0
 
+    print(f"  {'OVERALL':<24} {'':12} avg={summary['overall']:.4f}", file=sys.stderr)
+    print("=" * 100, file=sys.stderr)
 
-def _run_episode_detailed(task_id: str, scenario_index: int) -> tuple[float, int, int, float]:
-    """Run episode and return (score, steps_used, actions_taken, cumulative_reward)."""
-    r = _session.post(
-        f"{ENV_BASE_URL}/reset",
-        params={"task_id": task_id, "scenario_index": scenario_index},
-        timeout=30,
-    )
-    r.raise_for_status()
-    obs = r.json()
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": _first_obs_msg(obs)},
-    ]
-
-    prev_queried: dict = {}
-    max_steps = obs.get("max_steps", 10)
-    actions_taken = 0
-    cumulative_reward = 0.0
-
-    for step_i in range(max_steps):
-        current_step = step_i + 1
-
-        raw = _llm_call_with_retry(messages)
-        messages.append({"role": "assistant", "content": raw or "{}"})
-
-        action = None
-        try:
-            if raw.strip():
-                action = _parse(raw)
-        except Exception:
-            pass
-
-        if action is None:
-            action = _smart_fallback(task_id, obs, current_step, max_steps)
-            print(f"    [FALLBACK] step {current_step}: {action.get('action_type')}", file=sys.stderr)
-        elif _should_override(task_id, action, obs, current_step, max_steps):
-            old_at = action.get("action_type")
-            action = _smart_fallback(task_id, obs, current_step, max_steps)
-            print(f"    [OVERRIDE] step {current_step}: {old_at} -> {action.get('action_type')}", file=sys.stderr)
-
-        sr = _session.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
-        sr.raise_for_status()
-        result = sr.json()
-        new_obs = result["observation"]
-        
-        actions_taken += 1
-        step_reward = result['reward']['value']
-        cumulative_reward = result['reward'].get('cumulative', cumulative_reward + step_reward)
-
-        # Step detail output
-        print(
-            f"    step {current_step:>2}: {action.get('action_type'):<28} "
-            f"reward={step_reward:+.3f}  done={result['done']}"
-        )
-
-        if result.get("done"):
-            break
-
-        step_msg = _step_msg(new_obs, prev_queried)
-        messages.append({"role": "user", "content": step_msg})
-        prev_queried = {
-            k: dict(v)
-            for k, v in new_obs.get("queried_data", {}).items()
-            if isinstance(v, dict)
-        }
-        obs = new_obs
-
-        if len(messages) > 20:
-            messages = messages[:2] + messages[-16:]
-
-    g = _session.get(f"{ENV_BASE_URL}/grader", timeout=30)
-    g.raise_for_status()
-    score = g.json().get("total", 0.0)
-    
-    return score, current_step, actions_taken, cumulative_reward
+    # JSON summary as the LAST line of stdout (for /baseline endpoint compatibility)
+    print(json.dumps(summary), flush=True)
 
 
 if __name__ == "__main__":
