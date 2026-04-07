@@ -61,11 +61,15 @@ def grade(task_id: str, state: dict, scenario: dict) -> dict:
     fn = _graders.get(task_id)
     if fn is None:
         return {
-            "total": 0.0,
+            "total": 0.01,  # ← was 0.0
             "breakdown": {},
             "feedback": f"Unknown task_id '{task_id}'",
         }
-    return fn(state, scenario)
+    result = fn(state, scenario)
+    # Clamp to open interval (0, 1) — validator requires strictly between 0 and 1
+    result["total"] = max(0.01, min(0.99, result["total"]))
+    return result
+
 
 
 # ── Task 1: Alert Classification (Easy) ──────────────────────────────────────
